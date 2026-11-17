@@ -17,9 +17,8 @@
 
 #include "constellation/t_constellation_tracker.h"
 
-#include "math/m_relation_history.hpp"
-
 #include "imu_preintegration.hpp"
+#include "covariance_relation_history.hpp"
 
 #include <array>
 #include <atomic>
@@ -237,6 +236,13 @@ struct DeviceSolveState
 	xrt_vec3_f64 world_velocity;
 	//! The imu calibration at the solve
 	DeviceImuCalibration imu_calibration;
+	/*!
+	 * The pose covariance at the solve, in the solver's tangent space (world position, LED model local rotation,
+	 * world velocity).
+	 *
+	 * @see PoseCovarianceIndex
+	 */
+	PoseCovarianceMatrix covariance = PoseCovarianceMatrix::Zero();
 };
 
 struct Device
@@ -255,7 +261,7 @@ public: // Fields
 	std::optional<DeviceSolveState> latest_imu_reckon;
 
 	//! The relation history of the device, used as a fast way to retrieve the latest dead-reckoned poses.
-	RelationHistory imu_relation_history;
+	CovarianceRelationHistory imu_relation_history;
 	/*!
 	 * The relation history containing only the exact camera keyframes, to allow access to exact fused keyframes.
 	 *
@@ -263,7 +269,7 @@ public: // Fields
 	 * camera keyframe poses, so that a late camera can get the full solved pose from other cameras, this is the way
 	 * to go about that.
 	 */
-	RelationHistory keyframe_relation_history;
+	CovarianceRelationHistory keyframe_relation_history;
 
 	//! Pre-calibrated accelerometer bias, in meters per second squared.
 	DeviceImuCalibration stored_imu_calibration;
@@ -344,10 +350,14 @@ struct SolvedDeviceKeyframe
 	//! Solved world-frame velocity, in meters per second.
 	xrt_vec3_f64 linear_velocity;
 
-	//! Whether the world-frame angular velocity is valid.
-	bool angular_velocity_valid;
-	//! World-frame angular velocity, in radians per second.
-	xrt_vec3_f64 angular_velocity;
+	//! Whether or not the IMU sample is valid.
+	bool imu_sample_valid;
+	//! Device-frame raw IMU sample that ended the preintegration.
+	xrt_imu_sample raw_imu_sample;
+	//! Device-frame calibrated IMU sample that ended the preintegration.
+	xrt_imu_sample calibrated_imu_sample;
+	//! World-frame IMU sample that ended the preintegration.
+	xrt_imu_sample world_imu_sample;
 
 	//! Solved accelerometer bias, in meters per second squared.
 	xrt_vec3_f64 accel_bias;
@@ -355,14 +365,13 @@ struct SolvedDeviceKeyframe
 	xrt_vec3_f64 gyro_bias;
 	//! Solved per-axis accelerometer scale, unitless.
 	xrt_vec3_f64 accel_scale;
-#ifdef XRT_FEATURE_RERUN
+
 	/*!
 	 * The covariance matrix of this solve's keyframe parameters of the pose
 	 *
 	 * @see PoseCovarianceIndex
 	 */
 	PoseCovarianceMatrix covariance;
-#endif // XRT_FEATURE_RERUN
 };
 
 /*!

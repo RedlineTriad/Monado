@@ -146,78 +146,6 @@ sampleNoiseDensitySquared(const Vector3d &reading, const xrt_imu_sensor_calibrat
 	return density_squared;
 }
 
-/*!
- * Propagates the covariance for this sample.
- *
- * @param[in]  Q_start_cur     Rotation accumulated *before* this sample.
- * @param[in]  measured_accel  Acceleration as measured, in the IMU frame, which the sample noise depends on.
- * @param[in]  measured_gyro   Gyroscope reading as measured, which the sample noise depends on.
- * @param[in]  corrected_accel Bias and scale-corrected acceleration, in the IMU frame.
- * @param[in]  corrected_gyro  Bias-corrected gyroscope reading.
- * @param[in]  accel_scale     The accelerometer scale.
- * @param[in]  imu_calibration The noise model of the IMU.
- * @param      dt              Delta time
- * @param[out] covariance      Out covariance matrix
- */
-static void
-propagateCovariance(const Quaterniond &Q_start_cur,
-                    const Vector3d &measured_accel,
-                    const Vector3d &measured_gyro,
-                    const Vector3d &corrected_accel,
-                    const Vector3d &corrected_gyro,
-                    const Vector3d &accel_scale,
-                    const xrt_imu_noise_calibration &imu_calibration,
-                    double dt,
-                    PoseCovarianceMatrix &covariance)
-{
-	if (dt <= 0.0) {
-		// A duplicated sample timestamp contributes nothing and would divide by zero below.
-		return;
-	}
-
-	const Matrix3d dR = Q_start_cur.toRotationMatrix();
-	const Matrix3d accel_skew = skew(corrected_accel);
-	const Matrix3d scale = accel_scale.asDiagonal();
-
-	/*
-	 * How the error already accumulated gets reshuffled by this sample's integration. The off-diagonal
-	 * blocks are where a rotation error leaks into velocity and position: point the accelerometer slightly
-	 * wrong and you integrate the acceleration slightly sideways.
-	 */
-	Matrix<double, kNumPoseCovIndices, kNumPoseCovIndices> A =
-	    Matrix<double, kNumPoseCovIndices, kNumPoseCovIndices>::Identity();
-	A.block<3, 3>(kPoseRotCovIndex, kPoseRotCovIndex) = //
-	    quat_exp_so3(Vector3d(-corrected_gyro * dt)).toRotationMatrix();
-	A.block<3, 3>(kPoseVelCovIndex, kPoseRotCovIndex) = //
-	    -dR * accel_skew * dt;
-	A.block<3, 3>(kPosePosCovIndex, kPoseRotCovIndex) = //
-	    -0.5 * dR * accel_skew * dt * dt;
-	A.block<3, 3>(kPosePosCovIndex, kPoseVelCovIndex) = //
-	    Matrix3d::Identity() * dt;
-
-	/*
-	 * How this sample's sensor noise enters. The gyro noise turns into a rotation through the right Jacobian.
-	 * The accel noise is scaled along with the signal, since the scale is applied to the reading.
-	 */
-	Matrix<double, kNumPoseCovIndices, 6> B = Matrix<double, kNumPoseCovIndices, 6>::Zero();
-	B.block<3, 3>(kPoseRotCovIndex, 0) = rightJacobianSo3(corrected_gyro * dt) * dt;
-	B.block<3, 3>(kPoseVelCovIndex, 3) = dR * scale * dt;
-	B.block<3, 3>(kPosePosCovIndex, 3) = 0.5 * dR * scale * dt * dt;
-
-	const Vector3d gyro_density_squared = sampleNoiseDensitySquared(measured_gyro, imu_calibration.gyro);
-	const Vector3d accel_density_squared = sampleNoiseDensitySquared(measured_accel, imu_calibration.accel);
-
-	/*
-	 * Density squared over the interval this sample covers, so the partial steps at the keyframe
-	 * boundaries contribute proportionally less than a full one.
-	 */
-	Matrix<double, 6, 6> noise = Matrix<double, 6, 6>::Zero();
-	noise.block<3, 3>(0, 0) = (gyro_density_squared / dt).asDiagonal();
-	noise.block<3, 3>(3, 3) = (accel_density_squared / dt).asDiagonal();
-
-	covariance = A * covariance * A.transpose() + B * noise * B.transpose();
-}
-
 static void
 integrateSingleSample(const xrt_imu_sample &sample,
                       double dt,
@@ -311,6 +239,65 @@ robustComputeSqrtAndPinvSqrt(const MatrixXd &a, MatrixXd &out_j, MatrixXd &out_j
  * Exported functions
  *
  */
+
+void
+propagateCovariance(const Quaterniond &Q_start_cur,
+                    const Vector3d &measured_accel,
+                    const Vector3d &measured_gyro,
+                    const Vector3d &corrected_accel,
+                    const Vector3d &corrected_gyro,
+                    const Vector3d &accel_scale,
+                    const xrt_imu_noise_calibration &imu_calibration,
+                    double dt,
+                    PoseCovarianceMatrix &covariance)
+{
+	if (dt <= 0.0) {
+		// A duplicated sample timestamp contributes nothing and would divide by zero below.
+		return;
+	}
+
+	const Matrix3d dR = Q_start_cur.toRotationMatrix();
+	const Matrix3d accel_skew = skew(corrected_accel);
+	const Matrix3d scale = accel_scale.asDiagonal();
+
+	/*
+	 * How the error already accumulated gets reshuffled by this sample's integration. The off-diagonal
+	 * blocks are where a rotation error leaks into velocity and position: point the accelerometer slightly
+	 * wrong and you integrate the acceleration slightly sideways.
+	 */
+	Matrix<double, kNumPoseCovIndices, kNumPoseCovIndices> A =
+	    Matrix<double, kNumPoseCovIndices, kNumPoseCovIndices>::Identity();
+	A.block<3, 3>(kPoseRotCovIndex, kPoseRotCovIndex) = //
+	    quat_exp_so3(Vector3d(-corrected_gyro * dt)).toRotationMatrix();
+	A.block<3, 3>(kPoseVelCovIndex, kPoseRotCovIndex) = //
+	    -dR * accel_skew * dt;
+	A.block<3, 3>(kPosePosCovIndex, kPoseRotCovIndex) = //
+	    -0.5 * dR * accel_skew * dt * dt;
+	A.block<3, 3>(kPosePosCovIndex, kPoseVelCovIndex) = //
+	    Matrix3d::Identity() * dt;
+
+	/*
+	 * How this sample's sensor noise enters. The gyro noise turns into a rotation through the right Jacobian.
+	 * The accel noise is scaled along with the signal, since the scale is applied to the reading.
+	 */
+	Matrix<double, kNumPoseCovIndices, 6> B = Matrix<double, kNumPoseCovIndices, 6>::Zero();
+	B.block<3, 3>(kPoseRotCovIndex, 0) = rightJacobianSo3(corrected_gyro * dt) * dt;
+	B.block<3, 3>(kPoseVelCovIndex, 3) = dR * scale * dt;
+	B.block<3, 3>(kPosePosCovIndex, 3) = 0.5 * dR * scale * dt * dt;
+
+	const Vector3d gyro_density_squared = sampleNoiseDensitySquared(measured_gyro, imu_calibration.gyro);
+	const Vector3d accel_density_squared = sampleNoiseDensitySquared(measured_accel, imu_calibration.accel);
+
+	/*
+	 * Density squared over the interval this sample covers, so the partial steps at the keyframe
+	 * boundaries contribute proportionally less than a full one.
+	 */
+	Matrix<double, 6, 6> noise = Matrix<double, 6, 6>::Zero();
+	noise.block<3, 3>(0, 0) = (gyro_density_squared / dt).asDiagonal();
+	noise.block<3, 3>(3, 3) = (accel_density_squared / dt).asDiagonal();
+
+	covariance = A * covariance * A.transpose() + B * noise * B.transpose();
+}
 
 FactorFitness
 evaluateFactorFitness(ceres::Problem &problem, const std::vector<ceres::ResidualBlockId> &residual_blocks)
@@ -487,7 +474,7 @@ preintegrate(const std::span<const xrt_imu_sample> &imu_samples,
 		                      delta_position, covariance);
 	}
 
-	xrt_vec3_f64 body_angular_velocity = imu_samples.back().gyro_rad_secs;
+	xrt_imu_sample end_imu_sample = imu_samples.back();
 
 	// Integrate the last sample to end time, if necessary.
 	if (last_sample.timestamp_ns < end_time_ns) {
@@ -496,7 +483,7 @@ preintegrate(const std::span<const xrt_imu_sample> &imu_samples,
 		integrateSingleSample(first_sample_after_end_time, dt, imu_bias, imu_calibration, Q_start_cur,
 		                      delta_velocity, delta_position, covariance);
 
-		body_angular_velocity = first_sample_after_end_time.gyro_rad_secs;
+		end_imu_sample = first_sample_after_end_time;
 	}
 
 	// Extract out the jacobians from Jet states.
@@ -507,8 +494,8 @@ preintegrate(const std::span<const xrt_imu_sample> &imu_samples,
 	    .Q_start_end = {Q_start_cur.w().a, Q_start_cur.x().a, Q_start_cur.y().a, Q_start_cur.z().a},
 	    .delta_velocity = {delta_velocity[0].a, delta_velocity[1].a, delta_velocity[2].a},
 	    .delta_position = {delta_position[0].a, delta_position[1].a, delta_position[2].a},
-	    .body_angular_velocity_valid = true,
-	    .body_angular_velocity = map_vec3_f64(body_angular_velocity),
+	    .imu_sample_valid = true,
+	    .imu_sample = end_imu_sample,
 
 	    .whitening = {},
 

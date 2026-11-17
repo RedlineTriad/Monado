@@ -222,6 +222,30 @@ rotateCovarianceRotBlock(const PoseCovarianceMatrix &covariance, const Quaternio
 void
 covariancePositionRadius(const PoseCovarianceMatrix &covariance, xrt_vec3 &out_radii, xrt_quat &out_Q_origin_cov);
 
+/*!
+ * Propagates the covariance for this sample.
+ *
+ * @param[in]  Q_start_cur     Rotation accumulated *before* this sample.
+ * @param[in]  measured_accel  Acceleration as measured, in the IMU frame, which the sample noise depends on.
+ * @param[in]  measured_gyro   Gyroscope reading as measured, which the sample noise depends on.
+ * @param[in]  corrected_accel Bias and scale-corrected acceleration, in the IMU frame.
+ * @param[in]  corrected_gyro  Bias-corrected gyroscope reading.
+ * @param[in]  accel_scale     The accelerometer scale.
+ * @param[in]  imu_calibration The noise model of the IMU.
+ * @param      dt              Delta time
+ * @param[out] covariance      Out covariance matrix
+ */
+void
+propagateCovariance(const Quaterniond &Q_start_cur,
+                    const Vector3d &measured_accel,
+                    const Vector3d &measured_gyro,
+                    const Vector3d &corrected_accel,
+                    const Vector3d &corrected_gyro,
+                    const Vector3d &accel_scale,
+                    const xrt_imu_noise_calibration &imu_calibration,
+                    double dt,
+                    PoseCovarianceMatrix &covariance);
+
 
 struct PreintegratedImuSamples
 {
@@ -235,9 +259,9 @@ struct PreintegratedImuSamples
 	Vector3d delta_position;
 
 	//! Whether the body angular velocity is valid.
-	bool body_angular_velocity_valid;
-	//! The body-frame angular velocity at the end of the window. Raw reading, apply calibration before using.
-	Vector3d body_angular_velocity;
+	bool imu_sample_valid;
+	//! The body-frame IMU sample at the end of the window. Raw reading, apply calibration before using.
+	xrt_imu_sample imu_sample;
 
 	//! The whitening matrix for this preintegration, the lower triangular.
 	PoseCovarianceMatrix whitening;
@@ -270,8 +294,8 @@ struct PreintegratedImuSamples
 		    .Q_start_end = Quaterniond::Identity(),
 		    .delta_velocity = Vector3d::Zero(),
 		    .delta_position = Vector3d::Zero(),
-		    .body_angular_velocity_valid = false,
-		    .body_angular_velocity = Vector3d::Zero(),
+		    .imu_sample_valid = false,
+		    .imu_sample = {},
 
 		    .whitening = PoseCovarianceMatrix::Zero(),
 
