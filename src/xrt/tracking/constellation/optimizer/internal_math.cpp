@@ -12,6 +12,11 @@
 #include "internal_math.hpp"
 #include "imu_preintegration.hpp"
 
+#include <Eigen/Eigenvalues>
+#include <Eigen/SparseCore>
+
+#include <unordered_set>
+
 
 namespace xrt::tracking::constellation::optimizer {
 
@@ -318,6 +323,107 @@ evaluateFactorFitness(ceres::Problem &problem, const std::vector<ceres::Residual
 
 	// Ceres reports half the sum of squares, matching its cost convention.
 	return {.num_residuals = residuals.size(), .chi_squared = cost * 2.0};
+}
+
+bool
+computeTangentCovariances(ceres::Problem &problem,
+                          const std::vector<const double *> &parameter_blocks,
+                          std::vector<Eigen::MatrixXd> &out_covariances)
+{
+	out_covariances.clear();
+	out_covariances.reserve(parameter_blocks.size());
+
+	/*
+	 * Every free block has to be in the evaluation, not just the requested ones, since the requested blocks'
+	 * covariance depends on everything they're correlated with. The requested ones go first, so their columns are
+	 * known. Constant blocks are left out entirely, which is how Ceres treats them too.
+	 */
+	ceres::Problem::EvaluateOptions options{};
+	options.apply_loss_function = true;
+	options.num_threads = 1;
+
+	std::vector<int> column_offsets(parameter_blocks.size(), -1);
+	std::unordered_set<const double *> requested;
+
+	int num_columns = 0;
+	for (size_t i = 0; i < parameter_blocks.size(); i++) {
+		const double *block = parameter_blocks[i];
+		requested.insert(block);
+
+		if (problem.IsParameterBlockConstant(block)) {
+			continue;
+		}
+
+		column_offsets[i] = num_columns;
+		num_columns += problem.ParameterBlockTangentSize(block);
+		// Evaluate only reads the values, it just doesn't take const pointers.
+		options.parameter_blocks.push_back(const_cast<double *>(block));
+	}
+
+	std::vector<double *> all_blocks;
+	problem.GetParameterBlocks(&all_blocks);
+	for (double *block : all_blocks) {
+		if (requested.count(block) != 0 || problem.IsParameterBlockConstant(block)) {
+			continue;
+		}
+
+		num_columns += problem.ParameterBlockTangentSize(block);
+		options.parameter_blocks.push_back(block);
+	}
+
+	ceres::CRSMatrix jacobian_crs;
+	if (!problem.Evaluate(options, nullptr, nullptr, nullptr, &jacobian_crs)) {
+		return false;
+	}
+	assert(jacobian_crs.num_cols == num_columns);
+
+	// The CRS arrays are already a row major sparse matrix, so this is a view rather than a copy.
+	const Eigen::Map<const Eigen::SparseMatrix<double, Eigen::RowMajor, int>> J( //
+	    jacobian_crs.num_rows,                                                   //
+	    jacobian_crs.num_cols,                                                   //
+	    static_cast<Eigen::Index>(jacobian_crs.values.size()),                   //
+	    jacobian_crs.rows.data(),                                                //
+	    jacobian_crs.cols.data(),                                                //
+	    jacobian_crs.values.data());                                             //
+
+	// The Jacobian is block sparse, so the product is cheap, and only the result needs to be dense.
+	const Eigen::SparseMatrix<double> JtJ_sparse = J.transpose() * J;
+	const MatrixXd JtJ = MatrixXd(JtJ_sparse);
+
+	Eigen::SelfAdjointEigenSolver<MatrixXd> saes(JtJ);
+	if (saes.info() != Eigen::Success) {
+		return false;
+	}
+
+	const VectorXd &eigenvalues = saes.eigenvalues();
+	const MatrixXd &eigenvectors = saes.eigenvectors();
+
+	/*
+	 * Ceres keeps singular values within sqrt(1e-14) of the largest, ie eigenvalues of JᵀJ within 1e-14 of the
+	 * largest. Clamped at zero, so an all-zero Hessian keeps nothing rather than everything.
+	 */
+	constexpr double kMinReciprocalConditionNumber = 1e-14;
+	const double tolerance = kMinReciprocalConditionNumber * std::max(eigenvalues.maxCoeff(), 0.0);
+
+	const auto keep = eigenvalues.array() > tolerance;
+	const VectorXd inverse_sqrt = keep.select(eigenvalues.array().max(tolerance).rsqrt(), 0.0);
+
+	// (JᵀJ)⁺ = W Wᵀ with W = E S^-1/2, so a diagonal block only needs W's rows for that block.
+	const MatrixXd W = eigenvectors * inverse_sqrt.asDiagonal();
+
+	for (size_t i = 0; i < parameter_blocks.size(); i++) {
+		const int size = problem.ParameterBlockTangentSize(parameter_blocks[i]);
+
+		if (column_offsets[i] < 0) {
+			out_covariances.emplace_back(MatrixXd::Zero(size, size));
+			continue;
+		}
+
+		const auto rows = W.middleRows(column_offsets[i], size);
+		out_covariances.emplace_back(rows * rows.transpose());
+	}
+
+	return true;
 }
 
 void

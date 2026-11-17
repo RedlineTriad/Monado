@@ -371,7 +371,7 @@ struct SolvedDeviceKeyframe
 	 *
 	 * @see PoseCovarianceIndex
 	 */
-	PoseCovarianceMatrix covariance;
+	PoseCovarianceMatrix covariance{PoseCovarianceMatrix::Zero()};
 };
 
 /*!
@@ -449,6 +449,9 @@ struct SolveSnapshot
 	double final_rms_sigma{0.0};
 
 	double solve_time_s{0.0};
+
+	//! Time spent computing the pose covariances after the solve
+	time_duration_ns covariance_time_ns{0};
 
 	//! Ceres' termination type, already stringified, since the logger has no business including Ceres headers.
 	std::string termination;

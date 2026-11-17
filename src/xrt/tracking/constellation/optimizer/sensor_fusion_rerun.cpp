@@ -218,6 +218,8 @@ RerunContext::logSolverMetrics(const SolveSnapshot &snapshot)
 	this->stream->log(metrics + "/final_rms_sigma", rerun::Scalars(snapshot.final_rms_sigma));
 	this->stream->log(metrics + "/iterations", rerun::Scalars(static_cast<double>(snapshot.num_iterations)));
 	this->stream->log(metrics + "/solve_time_ms", rerun::Scalars(snapshot.solve_time_s * 1000.0));
+	this->stream->log(metrics + "/covariance_time_ms",
+	                  rerun::Scalars(static_cast<double>(snapshot.covariance_time_ns) / 1e6));
 	this->stream->log(metrics + "/residuals", rerun::Scalars(static_cast<double>(snapshot.num_residuals)));
 	this->stream->log(metrics + "/parameter_blocks",
 	                  rerun::Scalars(static_cast<double>(snapshot.num_parameter_blocks)));

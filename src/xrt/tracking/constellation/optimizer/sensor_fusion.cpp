@@ -27,7 +27,6 @@
 #include <atomic>
 #include <bit>
 #include <cassert>
-#include <ceres/covariance.h>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -2019,14 +2018,8 @@ struct SensorFusionProblem
 			map_vec3_f64(solved.accel_scale) = bias.accel_scale;
 		}
 
-		ceres::Covariance::Options cov_options{};
-		cov_options.num_threads = 1; //! @todo measure if more threads is needed
-		cov_options.null_space_rank = -1;
-		cov_options.algorithm_type = ceres::CovarianceAlgorithmType::DENSE_SVD;
-		ceres::Covariance cov(cov_options);
-
 		std::vector<const double *> covariance_blocks;
-		// Collect the covariance blocks
+		std::vector<uint32_t> covariance_ages;
 		for (uint32_t age = 0; age < snapshot.num_keyframes; age++) {
 			// If the device isn't in this keyframe, skip it
 			if (!(snapshot.device.keyframe_mask & (1u << age))) {
@@ -2034,36 +2027,30 @@ struct SensorFusionProblem
 			}
 
 			const auto keyframe_ring_idx = fusion->keyframeIdxLocked(age);
-			const auto &keyframe_pose_vec = blocks.keyframes[keyframe_ring_idx];
-			covariance_blocks.push_back(keyframe_pose_vec.data());
+			covariance_blocks.push_back(blocks.keyframes[keyframe_ring_idx].data());
+			covariance_ages.push_back(age);
 		}
 
-		if (!cov.Compute(covariance_blocks, &problem)) {
+		const timepoint_ns covariance_start_ns = os_monotonic_get_ns();
+
+		std::vector<MatrixXd> covariances;
+		const bool computed = computeTangentCovariances(problem, covariance_blocks, covariances);
+
+		snapshot.covariance_time_ns = os_monotonic_get_ns() - covariance_start_ns;
+
+		if (!computed) {
+			/*
+			 * Rank deficiency doesn't land here, only the problem failing to evaluate or
+			 * the eigensolver failing, ie. a non-finite Jacobian at the solution. The
+			 * covariance isn't used for solving yet, but that means the solution itself
+			 * can't be trusted, so reset.
+			 */
 			SF_ERROR(fusion, "Failed to compute covariance matrix");
-			//! @todo is failure a common case? try to find recovery strategy maybe?
 			return false;
 		}
 
-		for (uint32_t age = 0; age < snapshot.num_keyframes; age++) {
-			// If the device isn't in this keyframe, skip it
-			if (!(snapshot.device.keyframe_mask & (1u << age))) {
-				continue;
-			}
-
-			SnapshotKeyframe &out = snapshot.keyframes[age];
-
-			const auto keyframe_ring_idx = fusion->keyframeIdxLocked(age);
-			const auto &keyframe_pose_parameters = blocks.keyframes[keyframe_ring_idx].data();
-
-			bool success = cov.GetCovarianceBlockInTangentSpace( //
-			    keyframe_pose_parameters,                        //
-			    keyframe_pose_parameters,                        //
-			    out.device.covariance.data());                   //
-			if (!success) {
-				SF_ERROR(fusion, "Failed to get covariance matrix for keyframe with age %u", age);
-				//! @todo is failure a common case?
-				return false;
-			}
+		for (size_t i = 0; i < covariance_ages.size(); i++) {
+			snapshot.keyframes[covariance_ages[i]].device.covariance = covariances[i];
 		}
 
 		return true;
