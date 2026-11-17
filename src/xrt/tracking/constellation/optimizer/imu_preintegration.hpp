@@ -197,6 +197,21 @@ static constexpr int kNumPoseCovIndices = static_cast<int>(PoseCovarianceIndex::
 typedef Matrix<double, kNumPoseCovIndices, kNumPoseCovIndices> PoseCovarianceMatrix;
 
 /*!
+ * Re-expresses the rotation block of a pose covariance in another frame, `J Σ Jᵀ` with `J = diag(I, R_new_old, I)`,
+ * since `δθ_new = R_new_old δθ_old`. Position and velocity are left alone, the frames are assumed to share an origin.
+ *
+ * @param covariance The covariance, with its rotation block in the old frame.
+ * @param Q_new_old  Rotation taking the old frame to the new one.
+ */
+inline PoseCovarianceMatrix
+rotateCovarianceRotBlock(const PoseCovarianceMatrix &covariance, const Quaterniond &Q_new_old)
+{
+	PoseCovarianceMatrix J = PoseCovarianceMatrix::Identity();
+	J.block<3, 3>(kPoseRotCovIndex, kPoseRotCovIndex) = Q_new_old.toRotationMatrix();
+	return J * covariance * J.transpose();
+}
+
+/*!
  * Computes the radii and covariance orientation from the 3x3 position part of the pose covariance matrix
  * (3σ elliphoir, so 97%-ish probability containment, assuming a perfectly matching noise model).
  *
