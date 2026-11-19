@@ -137,6 +137,7 @@ public: // Fields
 	//! The camera's position in the constellation tracker's tracking origin
 	std::optional<xrt_pose> Txr_world_cam{std::nullopt};
 
+	std::array<t_constellation_device_id_t, XRT_CONSTELLATION_MAX_DEVICES> device_ids_by_distance{};
 	std::array<DeviceState, XRT_CONSTELLATION_MAX_DEVICES> device_states{};
 	uint32_t device_count{};
 

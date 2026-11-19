@@ -409,18 +409,20 @@ Camera::tryDevicePose(Device *device,
 		    sample.blob_count,                           //
 		    &device->params.led_model,                   //
 		    device->id,                                  //
+		    sample.device_ids_by_distance.data(),        //
 		    &this->model,                                //
 		    NULL);                                       //
 	} else {
-		success = pose_metrics_evaluate_pose( //
-		    &score,                           //
-		    &Tcv_cam_device_candidate,        //
-		    sample.blobs,                     //
-		    sample.blob_count,                //
-		    &device->params.led_model,        //
-		    device->id,                       //
-		    &this->model,                     //
-		    NULL);                            //
+		success = pose_metrics_evaluate_pose(     //
+		    &score,                               //
+		    &Tcv_cam_device_candidate,            //
+		    sample.blobs,                         //
+		    sample.blob_count,                    //
+		    &device->params.led_model,            //
+		    device->id,                           //
+		    sample.device_ids_by_distance.data(), //
+		    &this->model,                         //
+		    NULL);                                //
 	}
 
 	// The actual call itself failed.
@@ -519,11 +521,20 @@ Camera::tryDeviceBlobRecovery(Device *device,
 		    sample.blob_count,                           //
 		    &device->params.led_model,                   //
 		    device->id,                                  //
+		    sample.device_ids_by_distance.data(),        //
 		    &this->model,                                //
 		    NULL);
 	} else {
-		success = pose_metrics_evaluate_pose(&score, &Tcv_cam_device, sample.blobs, sample.blob_count,
-		                                     &device->params.led_model, device->id, &this->model, NULL);
+		success = pose_metrics_evaluate_pose(     //
+		    &score,                               //
+		    &Tcv_cam_device,                      //
+		    sample.blobs,                         //
+		    sample.blob_count,                    //
+		    &device->params.led_model,            //
+		    device->id,                           //
+		    sample.device_ids_by_distance.data(), //
+		    &this->model,                         //
+		    NULL);                                //
 	}
 
 	// If the evaluate failed entirely, this isn't a success.
@@ -643,6 +654,11 @@ Camera::processSampleSlow(CameraSample &sample)
 	CT_TRACE(tracker, "Starting slow processing for camera %p with %u blobs", (void *)this, sample.blob_count);
 
 	correspondence_search_set_blobs(data.cs, sample.blobs, sample.blob_count);
+	// Copy in the device IDs by distance
+	std::memcpy(                                  //
+	    data.cs->device_ids_by_distance,          //
+	    sample.device_ids_by_distance.data(),     //
+	    sizeof(data.cs->device_ids_by_distance)); //
 
 	std::shared_ptr<CameraMosaic> mosaic = this->mosaic.lock();
 	U_ASSERT_WEAK_PTR_RET(mosaic,
@@ -877,6 +893,24 @@ Camera::processSampleFast(CameraSample &sample)
 	std::array<Device *, XRT_CONSTELLATION_MAX_DEVICES> devices{};
 	const uint32_t device_count = collect_devices_nearest_first(tracker, sample, devices);
 
+	{
+		uint32_t written_device_ids = 0;
+		for (uint32_t i = 0; i < device_count; i++) {
+			const auto device = devices[i];
+			const auto device_state = sample.getDeviceState(device->id).value();
+
+			// Only write the ID if the device has a pose in camera space.
+			if (device_state->Tcv_cam_device_predicted.has_value() &&
+			    device_state->Tcv_cam_device_predicted->relation_flags &
+			        XRT_SPACE_RELATION_POSITION_VALID_BIT) {
+				sample.device_ids_by_distance[written_device_ids++] = device->id;
+			}
+		}
+		for (uint32_t i = written_device_ids; i < XRT_CONSTELLATION_MAX_DEVICES; i++) {
+			sample.device_ids_by_distance[i] = XRT_CONSTELLATION_INVALID_DEVICE_ID;
+		}
+	}
+
 	bool need_slow_search = false;
 	for (uint32_t device_iter = 0; device_iter < device_count; device_iter++) {
 		Device *device = devices[device_iter];
@@ -1022,8 +1056,15 @@ Camera::pushPose(CameraSample &camera_sample,
 
 	// Match visible blobs to the pose we found
 	pose_metrics_blob_match_info blob_match_info;
-	pose_metrics_match_pose_to_blobs(&Tcv_cam_device_initial, camera_sample.blobs, camera_sample.blob_count,
-	                                 &device->params.led_model, device->id, &this->model, &blob_match_info);
+	pose_metrics_match_pose_to_blobs(                //
+	    &Tcv_cam_device_initial,                     //
+	    camera_sample.blobs,                         //
+	    camera_sample.blob_count,                    //
+	    &device->params.led_model,                   //
+	    device->id,                                  //
+	    camera_sample.device_ids_by_distance.data(), //
+	    &this->model,                                //
+	    &blob_match_info);                           //
 
 	// Mark all the new blobs using the match info
 	camera_sample.markMatchingBlobs(tracker, device->params.led_model, device->id, blob_match_info);
@@ -1063,9 +1104,15 @@ Camera::pushPose(CameraSample &camera_sample,
 			         Tcv_cam_device.position.z);
 
 			// Now that we've optimized the pose, we gotta update the match info
-			pose_metrics_match_pose_to_blobs(&Tcv_cam_device, camera_sample.blobs, camera_sample.blob_count,
-			                                 &device->params.led_model, device->id, &this->model,
-			                                 &blob_match_info);
+			pose_metrics_match_pose_to_blobs(                //
+			    &Tcv_cam_device,                             //
+			    camera_sample.blobs,                         //
+			    camera_sample.blob_count,                    //
+			    &device->params.led_model,                   //
+			    device->id,                                  //
+			    camera_sample.device_ids_by_distance.data(), //
+			    &this->model,                                //
+			    &blob_match_info);                           //
 
 			// Unmark any other blobs
 			camera_sample.markMatchingBlobs(tracker, device->params.led_model, device->id, blob_match_info);
@@ -1078,15 +1125,16 @@ Camera::pushPose(CameraSample &camera_sample,
 		}
 
 		// We need to re-evaluate the pose after optimization, since the reprojection error may have changed.
-		pose_metrics_evaluate_pose(    //
-		    &score,                    //
-		    &Tcv_cam_device,           //
-		    camera_sample.blobs,       //
-		    camera_sample.blob_count,  //
-		    &device->params.led_model, //
-		    device->id,                //
-		    &this->model,              //
-		    NULL);                     //
+		pose_metrics_evaluate_pose(                      //
+		    &score,                                      //
+		    &Tcv_cam_device,                             //
+		    camera_sample.blobs,                         //
+		    camera_sample.blob_count,                    //
+		    &device->params.led_model,                   //
+		    device->id,                                  //
+		    camera_sample.device_ids_by_distance.data(), //
+		    &this->model,                                //
+		    NULL);                                       //
 	}
 
 	// Move to OpenXR space
