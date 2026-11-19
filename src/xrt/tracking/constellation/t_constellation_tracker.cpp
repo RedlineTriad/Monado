@@ -902,7 +902,25 @@ Camera::processSampleFast(CameraSample &sample)
 			}
 		}
 
-		// if we have a valid prior pose, try to use it for fast matching
+		/*
+		 * if we have a valid prior pose, try to use it for fast matching, allowing down to 3 LEDs, but with
+		 * tight reprojection error checking against prior
+		 */
+		if (Tcv_cam_device_predicted.has_value() &&       //
+		    this->tryDevicePose(device,                   //
+		                        sample,                   //
+		                        device_state,             //
+		                        false,                    // need_matching_ids
+		                        Tcv_cam_device_predicted, //
+		                        Tcv_cam_device_predicted.value().pose)) {
+			CT_DEBUG(tracker, "Fast processing for device %d succeeded with predicted pose", device->id);
+			continue; // try the next device, we found a pose!
+		}
+
+		/*
+		 * if we have a valid prior pose, try to use it for fast matching, requiring more LEDs, but with looser
+		 * reprojection error checking against the prior
+		 */
 		if (Tcv_cam_device_predicted.has_value() && //
 		    this->tryDevicePose(device,             //
 		                        sample,             //
