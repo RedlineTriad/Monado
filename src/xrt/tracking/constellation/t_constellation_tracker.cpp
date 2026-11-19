@@ -563,7 +563,7 @@ Camera::tryDeviceBlobRecovery(Device *device,
 }
 
 void
-Camera::handleProcessingComplete(CameraSample &sample)
+Camera::handleStepComplete(CameraSample &sample)
 {
 	auto tracker = this->tracker;
 
@@ -598,6 +598,37 @@ Camera::handleProcessingComplete(CameraSample &sample)
 			}
 
 			found_pose->handled = true;
+		}
+	}
+}
+
+void
+Camera::handleProcessingComplete(CameraSample &sample, const std::span<Device *> devices)
+{
+	std::shared_ptr<CameraMosaic> mosaic = this->mosaic.lock();
+	U_ASSERT_WEAK_PTR_RET(mosaic,
+	                      "Camera mosaic was destroyed while processing a sample, this should never happen since "
+	                      "the mosaic owns the camera");
+
+	int64_t sequence_id = static_cast<int64_t>(sample.sequence_id); // signed for math
+
+	// Update the "was seen" states
+	for (auto &device : devices) {
+		const auto device_state = sample.getDeviceState(device->id);
+		if (!device_state.has_value()) {
+			continue;
+		}
+
+		std::lock_guard<os::Mutex> lock(device->data_lock);
+
+		auto &per_camera_data =
+		    device->locked_data.per_camera[(mosaic->index * XRT_TRACKING_MAX_CAMS) + this->index];
+
+		// Only mark if this is the newest sample.
+		if (device_state.value()->found_pose.has_value() &&
+		    (!per_camera_data.last_seen_sequence_id.has_value() ||
+		     sequence_id > per_camera_data.last_seen_sequence_id.value())) {
+			per_camera_data.last_seen_sequence_id = sequence_id;
 		}
 	}
 }
@@ -644,6 +675,11 @@ Camera::processSampleSlow(CameraSample &sample)
 			{
 				std::lock_guard<os::Mutex> lock(device->data_lock);
 
+				auto &device_camera_data =
+				    device->locked_data
+				        .per_camera[(mosaic->index * XRT_TRACKING_MAX_CAMS) + this->index];
+				int64_t sequence_id = static_cast<int64_t>(sample.sequence_id); // signed for math
+
 				bool enable_slow_skip =
 				    device->locked_data.last_known_pose.has_value() && // device has been seen
 				    Txr_world_cam.has_value();                         // we have a pose
@@ -651,15 +687,23 @@ Camera::processSampleSlow(CameraSample &sample)
 				if (enable_slow_skip) {
 					const auto &last_known_pose = *device->locked_data.last_known_pose;
 
-					time_duration_ns time_since_solve_ns =
+					time_duration_ns time_since_any_solve_ns =
 					    sample.timestamp_ns - last_known_pose.timestamp_ns;
 
-					if (time_since_solve_ns < (U_TIME_1MS_IN_NS * 150LL)) {
-						// If the device has been seen in the last 150ms, don't try to brute
-						// force search it, hope that it will be seen by a fast solve in that
-						// time period.
+					bool seen_by_any_camera_recently =
+					    time_since_any_solve_ns < (U_TIME_1MS_IN_NS * 150LL);
+					bool seen_by_this_camera_recently =
+					    device_camera_data.last_seen_sequence_id.has_value() &&
+					    (sequence_id - device_camera_data.last_seen_sequence_id.value() <= 3);
+
+					if (seen_by_any_camera_recently && !seen_by_this_camera_recently) {
+						/*
+						 * If the device has not been seen in the most recent 3 frames in this
+						 * specific camera, and has been seen globally in the last 150ms, skip a
+						 * shallow search for it.
+						 */
 						continue;
-					} else if ((time_since_solve_ns < (U_TIME_1MS_IN_NS * 1000LL) ||
+					} else if ((time_since_any_solve_ns < (U_TIME_1MS_IN_NS * 1000LL) ||
 					            this->shallow_searches_failed.load() < 10) &&
 					           (search_flags & CS_FLAG_DEEP_SEARCH)) {
 						// Don't do a deep search until a shallow search has failed for one full
@@ -771,7 +815,9 @@ Camera::processSampleSlow(CameraSample &sample)
 
 	this->debugScribbleSample(sample, false);
 
-	this->handleProcessingComplete(sample);
+	this->handleStepComplete(sample);
+
+	this->handleProcessingComplete(sample, {devices.data(), device_count});
 }
 
 bool
@@ -932,7 +978,11 @@ Camera::processSampleFast(CameraSample &sample)
 	 * Handle any poses that this sample may now have, it's okay if this is called again in the slow thread, that's
 	 * what @ref FoundDevicePose::handled is for.
 	 */
-	this->handleProcessingComplete(sample);
+	this->handleStepComplete(sample);
+
+	if (!need_slow_search) {
+		this->handleProcessingComplete(sample, {devices.data(), device_count});
+	}
 
 	return need_slow_search;
 }
@@ -1183,8 +1233,15 @@ Device::Device(ConstellationTracker *tracker,
                t_constellation_tracker_device_params *params,
                t_constellation_tracker_device *device,
                t_constellation_device_id_t id)
-    : params(*params), device(device), id(id), tracker(tracker), data_lock(),
-      locked_data({.last_known_pose = std::nullopt})
+    : params(*params),  //
+      device(device),   //
+      id(id),           //
+      tracker(tracker), //
+      data_lock(),      //
+      locked_data({
+          .last_known_pose = std::nullopt,
+          .per_camera = {},
+      })
 {
 	this->imu_sink = {
 	    .push_imu =

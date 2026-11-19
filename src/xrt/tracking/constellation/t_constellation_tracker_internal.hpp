@@ -42,6 +42,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -304,8 +305,13 @@ public: // Methods (t_constellation_tracker.cpp)
 	                      DeviceState &device_state,
 	                      const std::optional<xrt_space_relation> &Tcv_cam_device_prior);
 
+	//! Handles a single step (fast,slow) being complete
 	void
-	handleProcessingComplete(CameraSample &sample);
+	handleStepComplete(CameraSample &sample);
+
+	//! Handles complete processing of a sample, hold the devices lock while you call this.
+	void
+	handleProcessingComplete(CameraSample &sample, const std::span<Device *> devices);
 
 	void
 	processSampleSlow(CameraSample &sample);
@@ -393,6 +399,12 @@ public: // Fields
 	struct
 	{
 		std::optional<DeviceLastPose> last_known_pose;
+
+		struct
+		{
+			//! The latest sequence ID this device was seen at.
+			std::optional<int64_t> last_seen_sequence_id{std::nullopt};
+		} per_camera[XRT_CONSTELLATION_MAX_TRACKING_MOSAICS * XRT_TRACKING_MAX_CAMS];
 	} locked_data;
 	// clang-format on
 
