@@ -189,6 +189,13 @@ struct comp_target
 	bool (*check_ready)(struct comp_target *ct);
 
 	/*!
+	 * Try to rebuild an unavailable output without waiting for it to return.
+	 * Optional. Called each frame while the target is unavailable, after the
+	 * renderer has released its renderings.
+	 */
+	void (*reconnect)(struct comp_target *ct);
+
+	/*!
 	 * Is this target shared presentable image?
 	 *
 	 * Call before after @ref create_images
@@ -434,6 +441,19 @@ comp_target_check_ready(struct comp_target *ct)
 	COMP_TRACE_MARKER();
 
 	return ct->check_ready(ct);
+}
+
+/*!
+ * @copydoc comp_target::reconnect
+ *
+ * @ingroup comp_main
+ */
+static inline void
+comp_target_reconnect(struct comp_target *ct)
+{
+	if (ct->reconnect != NULL) {
+		ct->reconnect(ct);
+	}
 }
 
 /*!
