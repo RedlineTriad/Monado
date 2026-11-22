@@ -47,6 +47,9 @@ struct comp_target_swapchain
 	//! Also works as a frame index.
 	int64_t current_frame_id;
 
+	//! Maximum time to wait for an output image.
+	uint64_t acquire_timeout_ns;
+
 	struct
 	{
 		/*!
@@ -176,6 +179,10 @@ comp_target_swapchain_init_and_set_fnptrs(struct comp_target_swapchain *cts,
  */
 void
 comp_target_swapchain_override_extents(struct comp_target_swapchain *cts, VkExtent2D extent);
+
+//! Free presentation resources while preserving frame pacing.
+void
+comp_target_swapchain_reset_output(struct comp_target_swapchain *cts);
 
 /*!
  * Free all managed resources on the given @ref comp_target_swapchain,

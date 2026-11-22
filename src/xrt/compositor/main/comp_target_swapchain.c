@@ -982,10 +982,13 @@ comp_target_swapchain_acquire_next_image(struct comp_target *ct, uint32_t *out_i
 	VkResult ret = vk->vkAcquireNextImageKHR(  //
 	    vk->device,                            // device
 	    cts->swapchain.handle,                 // swapchain
-	    UINT64_MAX,                            // timeout
+	    cts->acquire_timeout_ns,               // timeout
 	    cts->base.semaphores.present_complete, // semaphore
 	    VK_NULL_HANDLE,                        // fence
 	    out_index);                            // pImageIndex
+	if (ret == VK_TIMEOUT) {
+		return ret;
+	}
 	VK_CHK_AND_RET(ret, "vkAcquireNextImageKHR");
 
 #ifdef VK_KHR_shared_presentable_image
@@ -1283,14 +1286,13 @@ comp_target_swapchain_override_extents(struct comp_target_swapchain *cts, VkExte
 }
 
 void
-comp_target_swapchain_cleanup(struct comp_target_swapchain *cts)
+comp_target_swapchain_reset_output(struct comp_target_swapchain *cts)
 {
 	struct vk_bundle *vk = get_vk(cts);
 
 	// Thread if it has been started must be stopped first.
 	if (cts->vblank.thread_running) {
-		// Destroy also stops the thread.
-		os_thread_helper_destroy(&cts->vblank.event_thread);
+		os_thread_helper_stop_and_wait(&cts->vblank.event_thread);
 		cts->vblank.thread_running = false;
 	}
 
@@ -1313,7 +1315,22 @@ comp_target_swapchain_cleanup(struct comp_target_swapchain *cts)
 	}
 
 	target_fini_semaphores(cts);
+	cts->base.image_count = 0;
+	cts->base.wait_for_present_supported = false;
+	cts->display = VK_NULL_HANDLE;
+	cts->vblank.should_wait = false;
+	cts->vblank.last_vblank_ns = 0;
+	cts->vblank.event_active = false;
+#ifdef VK_KHR_shared_presentable_image
+	cts->shared_present_acquired = false;
+#endif
+}
 
+void
+comp_target_swapchain_cleanup(struct comp_target_swapchain *cts)
+{
+	comp_target_swapchain_reset_output(cts);
+	os_thread_helper_destroy(&cts->vblank.event_thread);
 	u_pc_destroy(&cts->upc);
 }
 
@@ -1342,6 +1359,7 @@ comp_target_swapchain_init_and_set_fnptrs(struct comp_target_swapchain *cts,
                                           enum comp_target_display_timing_usage timing_usage)
 {
 	cts->timing_usage = timing_usage;
+	cts->acquire_timeout_ns = UINT64_MAX;
 	cts->base.check_ready = comp_target_swapchain_check_ready;
 	cts->base.is_shared_presentable_image = comp_target_swapchain_is_shared_presentable_image;
 	cts->base.create_images = comp_target_swapchain_create_images;

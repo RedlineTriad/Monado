@@ -607,6 +607,9 @@ renderer_ensure_images_and_renderings(struct comp_renderer *r, bool force_recrea
 	}
 
 	comp_target_create_images(target, &info, r->c->base.vk.main_queue);
+	if (!comp_target_has_images(target)) {
+		return false;
+	}
 
 	bool pre_rotate = false;
 	if (target->surface_transform & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
@@ -812,8 +815,12 @@ renderer_acquire_swapchain_image(struct comp_renderer *r)
 		ret = comp_target_acquire(r->c->target, &buffer_index);
 	}
 
+	if (ret == VK_TIMEOUT || ret == VK_NOT_READY) {
+		return;
+	}
 	if (ret != VK_SUCCESS) {
 		COMP_ERROR(r->c, "comp_target_acquire: %s", vk_str_result(ret));
+		return;
 	}
 
 	r->acquired_buffer = buffer_index;
@@ -825,6 +832,7 @@ renderer_resize(struct comp_renderer *r)
 	if (!comp_target_check_ready(r->c->target)) {
 		// Can't create images right now.
 		// Just close any existing renderings.
+		renderer_wait_queue_idle(r);
 		renderer_close_renderings_and_fences(r);
 		return;
 	}
@@ -1080,6 +1088,16 @@ dispatch_compute(struct comp_renderer *r,
  *
  */
 
+static xrt_result_t
+renderer_skip_frame(struct comp_compositor *c, struct comp_target *ct)
+{
+	// Keep the compositor clock advancing without submitting GPU work.
+	comp_target_mark_submit_begin(ct, c->frame.rendering.id, os_monotonic_get_ns());
+	comp_target_mark_submit_end(ct, c->frame.rendering.id, os_monotonic_get_ns());
+	comp_frame_clear_locked(&c->frame.rendering);
+	return XRT_SUCCESS;
+}
+
 XRT_CHECK_RESULT xrt_result_t
 comp_renderer_draw(struct comp_renderer *r)
 {
@@ -1098,25 +1116,28 @@ comp_renderer_draw(struct comp_renderer *r)
 	// Tell the target we are starting to render, for frame timing.
 	comp_target_mark_begin(ct, c->frame.rendering.id, os_monotonic_get_ns());
 
-	// Are we ready to render? No - skip rendering.
-	if (!comp_target_check_ready(r->c->target)) {
-		// Need to emulate rendering for the timing.
-		//! @todo This should be discard.
-		comp_target_mark_submit_begin(ct, c->frame.rendering.id, os_monotonic_get_ns());
-		comp_target_mark_submit_end(ct, c->frame.rendering.id, os_monotonic_get_ns());
-
-		// Clear the rendering frame.
-		comp_frame_clear_locked(&c->frame.rendering);
-		return XRT_SUCCESS;
+	if (comp_target_check_ready(ct) || ct->reconnect != NULL) {
+		comp_target_flush(ct);
 	}
-
-	comp_target_flush(ct);
+	if (!comp_target_check_ready(ct) && ct->reconnect != NULL) {
+		if (r->buffer_count != 0) {
+			renderer_wait_queue_idle(r);
+			renderer_close_renderings_and_fences(r);
+		}
+		comp_target_reconnect(ct);
+	}
+	if (!comp_target_check_ready(ct)) {
+		return renderer_skip_frame(c, ct);
+	}
 
 	comp_target_update_timings(ct);
 
 	if (r->acquired_buffer < 0) {
 		// Ensures that renderings are created.
 		renderer_acquire_swapchain_image(r);
+		if (r->acquired_buffer < 0) {
+			return renderer_skip_frame(c, ct);
+		}
 	}
 
 	comp_target_update_timings(ct);
